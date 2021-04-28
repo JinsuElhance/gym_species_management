@@ -1,5 +1,6 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(name="gym_species_management",
     version='0.0.1',
-    install_requires=['gym'])
+    packages = find_packages(),
+    install_requires=["gym", "numpy", "pandas", "matplotlib", "stable-baselines3", "requests"])

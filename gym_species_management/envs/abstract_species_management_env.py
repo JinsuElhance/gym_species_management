@@ -1,27 +1,25 @@
 import math
-import ipdb
-
-
-from collections import OrderedDict
+import numpy as np
 
 import gym
 from gym import spaces, logger, error, utils
 from gym.utils import seeding
-import numpy as np
-from stable_baselines3.common.env_checker import check_env
-# from gym_species_management.envs.shared_env import *
 
+from stable_baselines3.common.env_checker import check_env
 class AbstractSpeciesManagementEnv(gym.Env) :
     metadata = {'render.modes' : ['human']}
     
     def __init__(self, 
-        beta, 
-        init_state = {"invasive_isolates": .2, "invasive_meadows": .1, "native_isolates": .3, "native_meadows" : .1, "budget": 100}, 
-        total_area = 200, 
-        TMax = 9, 
+        beta = 1, 
+        init_state = {
+            "invasive": np.array([.2, 0.1], dtype=np.float32), 
+            "native":  np.array([.3, .1], dtype=np.float32), 
+            "budget":  np.array([100.0], dtype=np.float32)},
+        total_area = 500, 
+        TMax = 10, 
         CR_min = 0.08,
-        invasive_growth = np.array([[1.115,0.00117], [0.256, 1.107]]),
-        native_growth = np.array([[1.038,0.0177], [0.085, 1.036]]),
+        invasive_growth = np.array([[1.115,0.00117], [0.256, 1.107]], dtype=np.float32),
+        native_growth = np.array([[1.038,0.0177], [0.085, 1.036]], dtype=np.float32),
         annual_budget = None,
         eradicate_isolate_cost = 3.3, 
         eradicate_meadow_cost = 3.3, 
@@ -59,26 +57,18 @@ class AbstractSpeciesManagementEnv(gym.Env) :
         else:
             self.annual_budget = annual_budget
 
-        #Use continuous action space, proportion of either budget or total_area
+        #Use continuous action space, proportion of budget
         self.action_space = spaces.Dict(spaces = {
-            "eradicate_isolates" : spaces.Box(low=0, high=1, shape=(1,)),
-            "eradicate_meadows" : spaces.Box(low=0, high=1, shape=(1,)),
-            "restore_isolates" : spaces.Box(low=0, high=1, shape=(1,))
+            "eradicate_isolate" : spaces.Box(low=0, high=1, shape=(1,)),
+            "eradicate_meadow" : spaces.Box(low=0, high=1, shape=(1,)),
+            "restore_isolate" : spaces.Box(low=0, high=1, shape=(1,))
         })
 
-        #Consider continuous and then round for "units" of grass.
+        #Continuous observation space indicating proportion of land covered by native and invasive Spartina
         self.observation_space = spaces.Dict({
-            # "invasive_isolates" : spaces.Discrete(total_area),
-            # "invasive_meadows" : spaces.Discrete(total_area),
-            # "native_isolates" : spaces.Discrete(total_area),
-            # "native_meadows" : spaces.Discrete(total_area),
-
-            # Continous State Space (Proportion of land)
-            "invasive_isolates" : spaces.Box(low=0, high=1, shape = (1,)),
-            "invasive_meadows" : spaces.Box(low=0, high=1, shape = (1,)),
-            "native_isolates" : spaces.Box(low=0, high=1, shape = (1,)),
-            "native_meadows" : spaces.Box(low=0, high=1, shape = (1,)),
-            "budget": spaces.Box(low=0, high=self.state["budget"] + (self.TMax * self.annual_budget), shape=(1,), dtype=np.float32)
+            "invasive" : spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32),
+            "native" : spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32),
+            "budget" : spaces.Box(low=0.0, high=self.state["budget"][0] + (self.TMax * self.annual_budget), shape=(1,), dtype=np.float32),
         })
 
         return
@@ -86,7 +76,6 @@ class AbstractSpeciesManagementEnv(gym.Env) :
     def step(self, action):
         #Validate action against constraints
         assert action in self.action_space
-        # e_isolates_units, e_meadows_units, r_isolates_units = self.fraction_into_area(action)
 
         #Fetches penalty of action and sets new state
         new_penalty = self.process_action(action)
@@ -95,20 +84,22 @@ class AbstractSpeciesManagementEnv(gym.Env) :
         self.years_passed += 1
 
         #Check terminal constraints.
-        insufficient_habitat = bool(self.state["insasive_meadows"] + self.state["native_meadows"] < (self.CR_min * self.total_area))
-        remaining_insasive = bool(self.state["invasive_isolates"] + self.state["invasive_meadows"] == 0)
+        insufficient_habitat = bool(self.state["invasive"][1] + self.state["native"][1] < self.CR_min_prop)
+        remaining_invasive = bool(self.state["invasive"][0] <= 0 and self.state["invasive"][1] <= 0)
         time_finished = bool(self.years_passed == self.TMax)
 
         #Check if done
-        done = bool(insufficient_habitat or remaining_insasive or time_finished)
-
-        if insufficient_habitat or (time_finished and remaining_insasive):
+        done = bool(insufficient_habitat or remaining_invasive or time_finished)
+        if done:
+            print(f"Insufficient Habitat: {insufficient_habitat} -- Remaining Invasive: {remaining_invasive} -- Time Finished: {time_finished}")
+        
+        if insufficient_habitat or (time_finished and remaining_invasive):
             new_penalty = -1000 #Destroyed Habitat
-
-        return self.state, new_penalty, done, {}
+        
+        return self.state, float(new_penalty), done, {}
 
     def reset(self):
-        self.state = self.init_state
+        self.state = self.init_state.copy()
         self.years_passed = 0
 
         return self.state
@@ -122,103 +113,77 @@ class AbstractSpeciesManagementEnv(gym.Env) :
     def close(self):
         super(AbstractSpeciesManagementEnv, self).close()
 
-    def process_action(self, action) :
+    def process_action(self, action):
         #Fraction of budget (Current)
-        ipdb.set_trace()
-
         total_action = max(action["eradicate_isolate"] + action["eradicate_meadow"] + action["restore_isolate"], 1)
         
-        norm_e_isolates_prop = action["eradicate_isolate"] / total_action * self.state["budget"] / 100#Fraction of the budget to spend on ~eradication~
-        e_isolates = (norm_e_isolates_prop * self.state["budget"] / self.eradicate_isolate_cost) / (self.total_area * self.state["invasive_isolates"]) * self.state["invasive_isolates"] # Get amount (units) to eradicate.
-        # m_e_isolates = min(, self.state["budget"] // self.eradicate_isolate_cost) # Find tightest constraints 
-        np.clip(e_isolates, a_min=0, a_max = self.state["invasive_isolates"] * self.total_area) #Clip by constraints (note: Hides a lot of information from the agent, potentially look into redefining the problem space.)
-
-        norm_e_meadows_prop = action["eradicate_meadow"] / total_action * self.state["budget"] / 100
-        e_meadows = (norm_e_meadows_prop * self.state["budget"] / self.eradicate_isolate_cost) / (self.total_area * self.state["invasive_meadows"]) * self.state["invasive_meadows"]
-        # m_e_meadows = min(, self.state["budget"] // self.eradicate_meadow_cost)
-        np.clip(e_meadows, a_min=0, a_max = self.state["invasive_meadows"] * self.total_area)
-
-        norm_r_isolates_prop = action["restore_isolate"] / total_action * self.state["budget"] / 100
-        r_isolates = (norm_r_isolates_prop * self.state["budget"] / self.restore_isolate_cost) / (self.total_area * self.state["native_isolates"]) * self.state["native_isolates"]
-        # m_r_isolates = min(, self.state["budget"] // self.restore_isolate_cost)
-        np.clip(r_isolates, a_min=0, a_max = self.state["native_isolates"] * self.total_area)
-
-        #Fraction of total area 
-        # requested_proportion = action["eradicate_isolates"]  + action["eradicate_meadows"] + action["restore_isolates"]
-
-        #Convert each action proportion into area units and then clip by constraints.
-        # norm_e_isolates_prop = action["eradicate_isolates"] / requested_proportion
-        # e_isolates_units = round(action["eradicate_isolates"] / (requested_proportion * self.total_area))
-        # m_e_isolates = min(self.state["invasive_isolates"], self.budget//self.eradicate_isolate_cost, self.observation_space["native_isolates"].n)
-        # np.clip(e_isolates_units, a_min=0, a_max = m_e_isolates)
-
-        # norm_e_meadows_prop = action["eradicate_meadows"] / requested_proportion
-        # e_meadows_units = round(action["eradicate_meadows"] / (requested_proportion * self.total_area))
-        # m_e_meadows = min(self.state["invasive_meadows"], self.budget//self.eradicate_meadow_cost, self.observation_space["native_isolates"].n)
-        # np.clip(e_meadows_units, a_min=0, a_max = m_e_meadows)
-
-        # norm_r_isolates_prop = action["restore_isolates"] / requested_proportion
-        # r_isolates_units = round(action["restore_isolates"] / (requested_proportion * self.total_area))
-        # m_r_isolates = min(self.state["native_isolates"], self.budget//self.restore_isolate_cost, self.observation_space["native_isolates"].n)
-        # np.clip(r_isolates_units, a_min=0, a_max = m_r_isolates)
-
-        fiscal_cost = self.eradicate_isolate_cost*e_isolates + self.eradicate_meadow_cost*e_meadows + self.restore_isolate_cost*r_isolates
+        norm_e_isolates_prop = action["eradicate_isolate"] / total_action * self.state["budget"] / 100 #Fraction of the budget to spend on ~eradication of isolates~
+        if self.state["invasive"][0] != 0.0:
+            e_isolates = (norm_e_isolates_prop * self.state["budget"] / self.eradicate_isolate_cost) / (self.total_area * self.state["invasive"][0]) * self.state["invasive"][0] # Prop of total area to remove from isolates.
+            e_isolates = np.clip(e_isolates, a_min=0, a_max = self.state["invasive"][0]) #Clip by constraints (note: Hides a lot of information from the agent, potentially look into redefining the problem space.)
+        else: 
+            e_isolates = 0.0
+            
+        norm_e_meadows_prop = action["eradicate_meadow"] / total_action * self.state["budget"] / 100 #Fraction of the budget to spend on ~eradication of meadows~
+        if self.state["invasive"][1] != 0.0:
+            e_meadows = (norm_e_meadows_prop * self.state["budget"] / self.eradicate_meadow_cost) / (self.total_area * self.state["invasive"][1]) * self.state["invasive"][1]
+            e_meadows = np.clip(e_meadows, a_min=0, a_max = self.state["invasive"][1])
+        else:
+            e_meadows = 0.0
+            
+        norm_r_isolates_prop = action["restore_isolate"] / total_action * self.state["budget"] / 100 #Fraction of the budget to spend on ~restoration of isolates~
+        if self.state["native"][0] != 0.0:
+            r_isolates = (norm_r_isolates_prop * self.state["budget"] / self.restore_isolate_cost) / (self.total_area * self.state["native"][0]) * self.state["native"][0]
+            r_isolates = np.clip(r_isolates, a_min=0, a_max = self.state["native"][0])
+        else:
+            r_isolates = 0.0
+            
+        fiscal_cost = (self.eradicate_isolate_cost * e_isolates * self.total_area) + (self.eradicate_meadow_cost * e_meadows * self.total_area) + (self.restore_isolate_cost * r_isolates * self.total_area)
         new_budget = self.state["budget"] - fiscal_cost + self.annual_budget
 
-        #Update Invasive Population
-        new_invasive_isolates, new_invasive_meadows = self.get_invasive_population(e_isolates, e_meadows)
-        #Update Native Population
-        new_native_isolates, new_native_meadows = self.get_native_population(r_isolates)
+        #Fetch New Invasive Population
+        new_invasive = self.get_invasive_population(e_isolates, e_meadows)
+        #Fetch New Native Population
+        new_native = self.get_native_population(r_isolates)
         
         #Update State
-        self.state["invasive_isolates"] = new_invasive_isolates
-        self.state["invasive_meadows"] = new_invasive_meadows
-        self.state["native_isolates"] = new_native_isolates
-        self.state["native_meadows"] = new_native_meadows
+        self.state["invasive"] = new_invasive
+        self.state["native"] = new_native
         self.state["budget"] = new_budget
+        
+        print(self.state)
 
         #Update Penalty (Includes cost of invasive spartina survival)
-        step_penalty = fiscal_cost - (self.invasive_damage_cost * (self.state["invasive_isolates"] + self.state["invasive_meadows"])) * self.beta**self.years_passed
-        
+        step_penalty = (fiscal_cost - (self.invasive_damage_cost * (sum(self.state["invasive"]) * self.total_area))) * (self.beta**self.years_passed)
+
         return step_penalty
 
     def get_invasive_population(self, eradicate_isolates, eradicate_meadows):
         """
         Gets updated invasive population based on units invasive spartina eradicated and growth matrix.
         Input:
-        (int) eradicate_isolates : units of isolates to eradicate
-        (int) eradicate_meadows : units of meadows to eradicate
+        (float) eradicate_isolates : prop of isolates land cover to eradicate
+        (float) eradicate_meadows : prop of meadows land cover to eradicate
+        Output: 
+        (float vector 2x1) new_invasive : vector of new invasive population land cover
         """
-        new_invasive_isolates = (self.invasive_growth[0][0] * self.state["invasive_isolates"] - eradicate_isolates) + (self.invasive_growth[0][1] * self.state["invasive_meadows"] - eradicate_meadows)
-        new_invasive_meadows = (self.invasive_growth[1][0] * self.state["invasive_isolates"] - eradicate_isolates) + (self.invasive_growth[1][1] * self.state["invasive_meadows"] - eradicate_meadows)
-
-        return new_invasive_isolates, new_invasive_meadows
+        new_invasive = np.matmul(self.invasive_growth, self.state["invasive"] - np.append(eradicate_isolates, eradicate_meadows))
+        new_invasive = np.clip(new_invasive, 0.0, 1.0)
+        
+        return new_invasive
     
     def get_native_population(self, restore_isolates):
         """
         Gets updated native population based on units native spartina restored and growth matrix.
         Input:
-        (int) restore_isolates : units of isolates to restore
+        (float) restore_isolates : prop of isolates land cover to restore
+        Output: 
+        (float vector 2x1) new_native : vector of new native population land cover
         """
-        new_native_isolates = (self.native_growth[0][0] * self.state["native_isolates"] + restore_isolates) + (self.native_growth[0][1] * self.state["native_meadows"])
-        new_native_meadows = (self.native_growth[1][0] * self.state["native_isolates"] + restore_isolates) + (self.native_growth[1][1] * self.state["native_meadows"])
+        new_native = np.matmul(self.native_growth, self.state["native"] + np.append(restore_isolates, [0.0]))
+        new_native = np.clip(new_native, 0.0, 1.0)
+        
+        return new_native
 
-        return new_native_isolates, new_native_meadows
-
-    def get_bare_area(self):
+    def get_bare_area_prop(self):
         return self.total_area - self.state["invasive_isolates"] - self.state["invasive_meadows"] - self.state["native_isolates"] - self.state["native_meadows"]
-
-test_env = AbstractSpeciesManagementEnv(1)
-
-while True:
-    print(test_env.state["invasive_isolates"],test_env.state["invasive_meadows"],test_env.state["native_isolates"],test_env.state["native_meadows"],test_env.state["budget"])
-
-    eradicate_isolates_input = float(input("What fraction of your budget would you like to spend on eradicating isolates?"))
-    eradicate_meadows_input = float(input("What fraction of your budget would you like to spend on eradicating meadows?"))
-    restore_isolates_input = float(input("What fraction of your budget would you like to spend on restoring isolates?"))
-
-    test_action = {"eradicate_isolate": eradicate_isolates_input, "eradicate_meadow": eradicate_meadows_input, "restore_isolate": restore_isolates_input}
-
-    test_env.process_action(test_action)
-
-# check_env(test_env)
